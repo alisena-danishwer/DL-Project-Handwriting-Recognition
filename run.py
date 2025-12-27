@@ -1,6 +1,14 @@
 """
-The method to run run.py file
+How to run this script (Inference + Evaluation):
+
 python run.py --test test/ --model model.h5 --labels labels.json --out result.csv
+
+This script:
+1. Loads a trained character-level CNN model
+2. Segments each test image into lines → words → characters
+3. Classifies each character
+4. Uses majority voting to predict the image-level class
+5. Saves predictions and prints evaluation metrics
 """
 
 import os
@@ -12,6 +20,7 @@ from tqdm import tqdm
 import argparse
 from tensorflow.keras.models import load_model
 
+# Evaluation metrics for multi-class classification
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -24,21 +33,28 @@ from sklearn.metrics import (
 # =======================
 # Argument Parser
 # =======================
-parser = argparse.ArgumentParser()
-parser.add_argument("--test", required=True)
-parser.add_argument("--model", required=True)
-parser.add_argument("--labels", required=True)
-parser.add_argument("--out", default="result.csv")
-parser.add_argument("--char_h", type=int, default=64)
-parser.add_argument("--char_w", type=int, default=64)
-parser.add_argument("--min_char_width", type=int, default=6)
+# Allows flexible execution from the command line
+parser = argparse.ArgumentParser(description="Run OCR-based classification on test images")
+
+parser.add_argument("--test", required=True, help="Directory containing test images")
+parser.add_argument("--model", required=True, help="Trained Keras model (.h5)")
+parser.add_argument("--labels", required=True, help="JSON file with class labels")
+parser.add_argument("--out", default="result.csv", help="Output CSV file")
+
+# Character preprocessing parameters (must match training)
+parser.add_argument("--char_h", type=int, default=64, help="Character image height")
+parser.add_argument("--char_w", type=int, default=64, help="Character image width")
+parser.add_argument("--min_char_width", type=int, default=6, help="Minimum valid character width")
+
 args = parser.parse_args()
 
 # =======================
 # Load Model & Labels
 # =======================
+# Load trained CNN model
 model = load_model(args.model)
 
+# Load label mapping (index → class name)
 with open(args.labels, "r") as f:
     labels = json.load(f)
 
@@ -48,26 +64,47 @@ index_to_label = {i: lab for i, lab in enumerate(labels)}
 # Helper Functions
 # =======================
 def to_grayscale(img):
+    """
+    Converts BGR image to grayscale if needed.
+    Ensures consistent input for thresholding.
+    """
     if len(img.shape) == 3:
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return img
 
 
 def segment_lines(gray):
+    """
+    Line segmentation using Horizontal Projection Profile.
+    Rows with high pixel density are considered text lines.
+    """
     h = gray.shape[0]
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Binarize image (text = white, background = black)
+    _, th = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    # Morphological closing to connect broken text rows
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # Horizontal projection (sum pixels row-wise)
     proj = np.sum(closed, axis=1)
 
+    # If image is blank, return full image as one line
     if proj.max() == 0:
         return [(0, h)]
 
+    # Threshold to remove noise
     thresh = max(1, int(0.03 * proj.max()))
+
     lines = []
     in_line = False
     start = 0
 
+    # Detect start and end of each line
     for y, v in enumerate(proj):
         if v > thresh and not in_line:
             in_line = True
@@ -78,6 +115,7 @@ def segment_lines(gray):
             if end - start >= 6:
                 lines.append((max(0, start - 2), min(h, end + 2)))
 
+    # Handle last line touching bottom
     if in_line:
         lines.append((start, h))
 
@@ -85,11 +123,18 @@ def segment_lines(gray):
 
 
 def segment_words_from_line(line_img):
+    """
+    Word segmentation using dilation.
+    Horizontally merges characters into word blobs.
+    """
     gray = to_grayscale(line_img)
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Wide horizontal kernel to merge characters
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
     dilated = cv2.dilate(th, kernel, iterations=1)
 
+    # Find connected components (words)
     contours, _ = cv2.findContours(
         dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -101,14 +146,21 @@ def segment_words_from_line(line_img):
             continue
         bboxes.append((x, y, w, h))
 
+    # Sort words from left to right
     bboxes = sorted(bboxes, key=lambda b: b[0])
+
     return [line_img[y:y+h, x:x+w] for (x, y, w, h) in bboxes]
 
 
 def segment_chars_from_word(word_img, min_char_width=4):
+    """
+    Character segmentation using Vertical Projection Profile.
+    Columns with low pixel density are treated as separators.
+    """
     gray = to_grayscale(word_img)
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
+    # Vertical projection (sum pixels column-wise)
     cols = np.sum(th, axis=0)
     thresh = max(1, int(0.05 * cols.max()))
     separators = cols <= thresh
@@ -127,6 +179,7 @@ def segment_chars_from_word(word_img, min_char_width=4):
             if end - start >= min_char_width:
                 chars.append(word_img[:, start:end])
 
+    # Handle last character reaching image boundary
     if in_char:
         end = len(separators)
         if end - start >= min_char_width:
@@ -136,6 +189,10 @@ def segment_chars_from_word(word_img, min_char_width=4):
 
 
 def resize_and_normalize_char(ch_img, target_h, target_w):
+    """
+    Resizes character image while preserving aspect ratio,
+    pads to fixed size, and normalizes to [0, 1].
+    """
     if len(ch_img.shape) == 2:
         ch = cv2.cvtColor(ch_img, cv2.COLOR_GRAY2RGB)
     else:
@@ -154,16 +211,11 @@ def resize_and_normalize_char(ch_img, target_h, target_w):
 
     return padded.astype(np.float32) / 255.0
 
-
 # =======================
-# Testing
+# Testing / Inference
 # =======================
 results = []
-correct = 0
-total = 0
-
-y_true = []
-y_pred = []
+y_true, y_pred = [], []
 
 test_files = [
     f for f in os.listdir(args.test)
@@ -171,7 +223,7 @@ test_files = [
 ]
 
 for f in tqdm(test_files, desc="Testing"):
-    true_class = f[:2]
+    true_class = f[:2]  # Ground-truth label from filename
     img = cv2.imread(os.path.join(args.test, f))
     if img is None:
         continue
@@ -181,11 +233,10 @@ for f in tqdm(test_files, desc="Testing"):
 
     chars_imgs = []
 
+    # Segmentation pipeline: Lines → Words → Characters
     for y1, y2 in lines:
         line_img = img[y1:y2, :]
-        words = segment_words_from_line(line_img)
-        if not words:
-            words = [line_img]
+        words = segment_words_from_line(line_img) or [line_img]
 
         for w in words:
             chars = segment_chars_from_word(w, args.min_char_width)
@@ -199,28 +250,25 @@ for f in tqdm(test_files, desc="Testing"):
                         resize_and_normalize_char(c, args.char_h, args.char_w)
                     )
 
+    # Skip image if no characters detected
     if not chars_imgs:
         results.append([f, true_class, "NO_CHARS_FOUND"])
         continue
 
+    # Predict character classes
     X_chars = np.array(chars_imgs)
     preds = model.predict(X_chars, batch_size=32, verbose=0)
     pred_labels = np.argmax(preds, axis=1)
 
+    # Majority voting for image-level classification
     pred_class = index_to_label[np.bincount(pred_labels).argmax()]
 
     results.append([f, true_class, pred_class])
-
     y_true.append(true_class)
     y_pred.append(pred_class)
 
-    if pred_class == true_class:
-        correct += 1
-    total += 1
-
-
 # =======================
-# Save CSV
+# Save Results to CSV
 # =======================
 with open(args.out, "w", newline="") as f:
     writer = csv.writer(f)
